@@ -2,26 +2,14 @@ package project.lars.gothic2.main;
 
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.IOException;
 import java.io.InputStreamReader;
-import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardWatchEventKinds;
-import java.nio.file.WatchKey;
-import java.nio.file.WatchService;
-import java.text.DateFormat;
-import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
+import java.util.Map;
 import java.util.Scanner;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 public class Starter {
 	static String CMD_COMMAND_PREFIX = "cmd /c ";
@@ -31,138 +19,56 @@ public class Starter {
 	static String GOTHIC_II_EXE = "system\\gothic2.exe";
 	static String SAVES_FOLDER = "saves";
 	static String BACKUP_SAVES_FOLDER = "saves_backup";
+	static String CURRENT = "current";
 
-	
-	private static class BackupService {
-		
-		final DateFormat DATE_FORMATTER = new SimpleDateFormat("dd_MM_yyyy HH-mm-ss");
-
-		final File backupSavesDir;
-		
-		final File origSaveGameDir;
-		
-		long lastStart = 0;
-		
-		
-		
-		public BackupService(File origSaveGameDir, File backupSavesDir) {
-			this.origSaveGameDir = origSaveGameDir;
-			this.backupSavesDir = backupSavesDir;
+	static Map<String, Object> props = new HashMap<String, Object>() {
+		{
+			put("numbness", 1000L);
+			put("delay", 5000L);
+			put("polltime", 8000L);
 		}
+	};
 
-		protected void doBackup(long delay) {
-			if (lastStart + 1000 < System.currentTimeMillis()) {
-				System.out.println("Change to directoy '" + origSaveGameDir + "' detected! Backup will be created in " + (delay / 1000) + " seconds.");
-				ForkJoinPool.commonPool().execute(() -> doSave(delay));
-				lastStart = System.currentTimeMillis();
-			}
-		}
-		
-		protected void stop() {
-			long sleeptime = lastStart + 5000 - System.currentTimeMillis();
-			if (sleeptime > 0) {
-				try {
-					Thread.sleep(sleeptime);
-				} catch (InterruptedException e) {
-					e.printStackTrace();
-				}
-			}
-		}
-
-		protected void doSave(long delay) {
-			try {
-				Thread.sleep(delay);
-			} catch (InterruptedException e) {
-				e.printStackTrace();
-			}
-
-    		File backupSaveGameDir = new File(backupSavesDir, DATE_FORMATTER.format(new Date()) + " " + origSaveGameDir.getName());
-    		backupSaveGameDir.delete();
-    		backupSaveGameDir.mkdir();
-    		for(File file : origSaveGameDir.listFiles()) {
-    			try {
-					Files.copy(file.toPath(), new File(backupSaveGameDir, file.getName()).toPath());
-				} catch (IOException e) {
-					System.err.println("Failed to copy File " + file.getName() + " to backup folder!");
-					e.printStackTrace();
-				}
-    		}
-			System.out.println("Backup created: '" + backupSaveGameDir.getName() + "'");
-		}
+	public static <T> T getProp(String key) {
+		return (T) props.get(key);
 	}
 
 	public static void main(String[] args) throws Exception {
 		
-		final Set<Thread> runners = new HashSet<>();
+		final Map<Thread, PathManager> runningStuff = new HashMap<>();
 		
-		for(String dirString : findInstallationPaths(args)) {
-			Thread runner = new Thread( ()-> {
-				try {
-					manageInstallationPath(dirString);
-				} catch (Exception e) {
-					System.out.println("An unexpected error occured! Dir '" + dirString + "' will no longer be monitored!");
-					e.printStackTrace();
-				}
-			});
-			runners.add(runner);
+		System.out.println("Savegame-Backuper started. Config:\n" + props);
+
+		for (Path path : findInstallationPaths(args)) {
+			File allSavesDir = path.resolve(SAVES_FOLDER).toFile();
+			File backupDir = path.resolve(BACKUP_SAVES_FOLDER).toFile();
+			PathManager pm = new PathManager(allSavesDir, backupDir);
+			Thread runner = new Thread(() -> pm.startMonitoring());
+			runningStuff.put(runner, pm);
 			runner.start();
 		}
 		
-		Runtime.getRuntime().addShutdownHook(new Thread() {
-	        public void run() {
+		Runtime.getRuntime().addShutdownHook(
+			new Thread(() -> {
                 System.out.println("Shutting down ...");
-                for (Thread runner : runners) {
-                	runner.interrupt();
+					for (PathManager pm : runningStuff.values()) {
+						pm.shutdown();
                 }
-	        }
-	    });
+	    	})
+		);
 		
-		for(Thread t : runners) {
+		for (Thread t : runningStuff.keySet()) {
 			t.join();
 		}
 		
 	}
 
-	private static void manageInstallationPath(String dirString) throws Exception {
-		File allSavesDir = Paths.get(dirString + File.separator + SAVES_FOLDER).toFile();
-		if (!allSavesDir.isDirectory()) {
-			throw new IllegalStateException("Invalid installation directory specified! Dir: " + allSavesDir.getCanonicalPath());
-		}
-		
-		File backupSavesDir = Paths.get(dirString + File.separator + BACKUP_SAVES_FOLDER).toFile();
-		if (!backupSavesDir.exists() || !backupSavesDir.isDirectory()) {
-			backupSavesDir.delete();
-			backupSavesDir.mkdir();
-		}
-		
-		ConcurrentMap<WatchKey, BackupService> watchkeyToSaveActionMap = new ConcurrentHashMap<>();
-		WatchService watchService = allSavesDir.toPath().getFileSystem().newWatchService();
-		
-		for(File saveGameDir : allSavesDir.listFiles((file, name) -> file.isDirectory() && !"current".equals(name))) {
-			WatchKey key = saveGameDir.toPath().register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
-			watchkeyToSaveActionMap.put(key, new BackupService(saveGameDir, backupSavesDir));
-			System.out.println("Monitoring: '" + saveGameDir.getCanonicalPath() + "'");
-		}
-		
-		while (true) {
-			try {
-			    WatchKey watchKey = watchService.poll(1, TimeUnit.MINUTES);
-			    if(watchKey != null) {
-			    	watchkeyToSaveActionMap.get(watchKey).doBackup(5000);
-			    	watchKey.pollEvents();
-				    watchKey.reset();
-			    }
-			} catch (InterruptedException ie) {
-				System.out.println("Shutting down directory listener for " + dirString);
-				watchkeyToSaveActionMap.values().forEach(backupService -> backupService.stop());
-		    }
-		}
-	}
 
-	private static Set<String> findInstallationPaths(String[] args) throws Exception {
+
+	private static Set<Path> findInstallationPaths(String[] args) throws Exception {
 		Process proc =  Runtime.getRuntime().exec(CMD_COMMAND_PREFIX + GOTHIC_DNDR_REGISTRY_KEY);
 		proc.waitFor();
-		Set<String> res = new HashSet<>();
+		Set<Path> res = new HashSet<>();
 		try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), "UTF-8"))) {
 			String gothic2dndrDir = br.lines().
 				filter(line -> line.contains(GOTHIC_REGISTRY_VALUE))
@@ -174,12 +80,12 @@ public class Starter {
 				.orElse("");
 			if (!gothic2dndrDir.isEmpty()) {
 				System.out.println("Found Gothic II DNdR: " + gothic2dndrDir);
-				res.add(gothic2dndrDir);
+				res.add(Paths.get(gothic2dndrDir));
 			}
 		}
 		for (int i = 0; i < args.length; i++) {
 			System.out.println("Adding start-argument: " + args[i]);
-			res.add(args[i]);
+			res.add(Paths.get(args[i]));
 		}
 		if (res.isEmpty()) {
 			System.out.println("Could not find any Gothic installation on your system.\nPlease insert the path to your Gothic installation folder.\n Press Enter again when your'e done:");
@@ -187,7 +93,11 @@ public class Starter {
 				String tmp = "X";
 				while(!tmp.isEmpty()) {
 					tmp = s.nextLine();
-					res.add(tmp);
+					try {
+						res.add(Paths.get(tmp));
+					} catch (Exception e) {
+						System.err.println("Invalid path syntax (" + e.getMessage() + ")! Try again:");
+					}
 				}
 			}
 		}
